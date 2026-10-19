@@ -24,7 +24,7 @@ class Threadpool {
     public:
         //线程池初始化
         //numWorkers:线程数量
-        ThreadPool(int numWorkers, int max_jobs);
+        bool init(int numWorkers, int max_jobs);
         //销毁线程池
         ~ThreadPool();
         //面向用户的添加任务
@@ -43,6 +43,15 @@ class Threadpool {
         pthread_cond_t m_jobs_cond;     //线程条件等待
         //当任务队列有新任务时唤醒worker的条件锁
         pthread_mutex_t m_jobs_mutex;   //为任务加锁防止一个任务被两个线程执行等其他情况
+    
+    bool Threadpool::init(int numWorkers, int max_jobs = 10){
+        if (numWorkers < 1 || max_jobs < 1) return false;
+        //初始化jobs_cond
+        if (pthread_cond_init(&m_jobs_cond, NULL)!= 0) {
+            perror("init m_jobs_cond fail")
+            return false;
+        }
+    }
 };
 
 //run为static函数
@@ -52,7 +61,7 @@ void* ThreadPool:: _run(void *arg) {
 }
 
 //threadLoop为普通成员函数
-void ThreadPool ::_threadLoop(void *arg) {
+void ThreadPool::_threadLoop(void *arg) {
     NWORKER *worker = (NWORKER *)arg;
     while(1) {
         //线程只有两个状态：执行\等待
@@ -110,4 +119,22 @@ bool ThreadPool::_addJob(NJOB *job) {
     //释放锁
     pthread_mutex_unlock(&m_jobs_mutex);
     return true;
+}
+
+//面向用户的添加任务
+bool ThreadPool::pushjob(void (*func)(void*), void *arg, int len)  {
+    struct NJOB *job = (struct NJOB*)malloc(sizeof(struct NJOB));
+    if (job == NULL) {
+        perror("malloc");
+        return -2;
+    }
+    memset(job, 0, sizeof(struct NJOB));
+
+    job->user_data = malloc(len);
+    memcpy(job->user_data, arg, len);
+    job->func = func;
+
+    _addJob(job);
+
+    return 1;
 }
