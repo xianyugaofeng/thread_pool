@@ -2,13 +2,43 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <chrono>
 #include <iostream>
+#include <thread>
 #include <pthread.h>
-#include <unistd.h>
-#include <sys/time.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
+
+namespace platform {
+
+inline void cpu_relax() {
+#if defined(_MSC_VER)
+    //YieldProcessor()是Windows SDK提供的宏，用于在多线程环境中提示处理器进行轻量级的等待
+    YieldProcessor();
+#elif defined(__i386__) || defined(__x86_64__)
+    asm volatile("pause" ::: "memory");
+#else
+    //提示调度器让出当前时间片给其他线程
+    //系统调用级的让出，不是轻量自旋提示
+    std::this_thread::yield();
+#endif
+}
+
+inline std::int64_t monotonic_time_us() {
+    //C++标准保证的单调时钟 取相对于时钟epoch的时长
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    //把steady_clock::duration转成微秒精度
+    return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+}
+
+inline void sleep_for(std::chrono::microseconds duration) {
+    //消费者/生产者等待较长时间时，替代忙等，降低CPU占用
+    //让当前线程睡眠至少duration
+    std::this_thread::sleep_for(duration);
+}
+
+} // namespace platform
 
 
 //配置常量
@@ -180,7 +210,7 @@ static bool spsc_is_empty(SPSC_QUEUE* queue) {
 
 
 //检查队列是否为满
-[[mabye_unused]] static bool spsc_is_full(SPSC_QUEUE* queue) {
+[[maybe_unused]] static bool spsc_is_full(SPSC_QUEUE* queue) {
     if (queue == nullptr) {
         perror("check full fail");
         return false;
@@ -211,7 +241,7 @@ static int spsc_queue_size(SPSC_QUEUE* queue) {
 
 //获取队列状态信息
 static Queue_Status spsc_get_status(SPSC_QUEUE* queue) {
-    Queue_Status status;
+    Queue_Status status{};
     if (queue == nullptr) {
         perror("get status fail");
         return status;
@@ -241,44 +271,43 @@ void performance_test(void) {
 
     Task test_task;
     unsigned int i;
-    struct timeval start, end;
-    long long elapsed_time;
+    std::int64_t elapsed_time;
 
     //空队列检查性能
-    gettimeofday(&start, NULL);
+    const std::int64_t start = platform::monotonic_time_us();
     for (i = 0; i < 1000000; ++i) {
         spsc_is_empty(&test_queue);
     }
-    gettimeofday(&end, NULL);
-    elapsed_time = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
-    printf("空队列检查性能: %lld microseconds\n", elapsed_time);
+    const std::int64_t end = platform::monotonic_time_us();
+    elapsed_time = end - start;
+    printf("空队列检查性能: %lld microseconds\n", static_cast<long long>(elapsed_time));
 
     //队列大小检查性能
-    gettimeofday(&start, NULL);
+    const std::int64_t size_start = platform::monotonic_time_us();
     for (i = 0; i < 1000000; ++i) {
         spsc_queue_size(&test_queue);
     }
 
-    gettimeofday(&end, NULL);
-    elapsed_time = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
-    printf("队列大小检查性能: %lld microseconds\n", elapsed_time);
+    const std::int64_t size_end = platform::monotonic_time_us();
+    elapsed_time = size_end - size_start;
+    printf("队列大小检查性能: %lld microseconds\n", static_cast<long long>(elapsed_time));
 
     //测试单线程推送性能
-    gettimeofday(&start, NULL);
+    const std::int64_t push_start = platform::monotonic_time_us();
     unsigned int push_count = 0;
     for (i = 0; i < QUEUE_SIZE - 1; ++i) {
         test_task.task_id = i;
-        test_task.timestamp = static_cast<std::uint64_t>(time(NULL));
+        test_task.timestamp = static_cast<std::uint64_t>(platform::monotonic_time_us());
         if (spsc_push(&test_queue, &test_task) == 0) {
             push_count++;
         }
     }
-    gettimeofday(&end, NULL);
-    elapsed_time = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
-    printf("单线程推送性能:%u操作成功 %lld microseconds\n", push_count, elapsed_time);
+    const std::int64_t push_end = platform::monotonic_time_us();
+    elapsed_time = push_end - push_start;
+    printf("单线程推送性能:%u操作成功 %lld microseconds\n", push_count, static_cast<long long>(elapsed_time));
 
     //测试单线程弹出性能
-    gettimeofday(&start, NULL);
+    const std::int64_t pop_start = platform::monotonic_time_us();
     unsigned int pop_count = 0;
     Task temp_task;
     for(i = 0; i < QUEUE_SIZE - 1; ++i) {
@@ -286,9 +315,9 @@ void performance_test(void) {
             pop_count++;
         }
     }
-    gettimeofday(&end, NULL);
-    elapsed_time = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
-    printf("单线程弹出性能:%u操作成功 %lld microseconds\n", pop_count, elapsed_time);
+    const std::int64_t pop_end = platform::monotonic_time_us();
+    elapsed_time = pop_end - pop_start;
+    printf("单线程弹出性能:%u操作成功 %lld microseconds\n", pop_count, static_cast<long long>(elapsed_time));
 
     //验证性能测试后队列的状态
     Queue_Status queue_status = spsc_get_status(&test_queue);
@@ -311,14 +340,14 @@ void* produce_thread(void* arg) {
     
     for(i = 0; i < MAX_Tasks; ++i) {
         task.task_id = i;
-        task.timestamp = static_cast<std::uint64_t>(time(NULL));
+        task.timestamp = static_cast<std::uint64_t>(platform::monotonic_time_us());
         for (unsigned int j = 0; j < TASK_DATA_SIZE; ++j) {
             task.data[j] = i * 10 + j; // 填充任务数据
         }
         
         while (spsc_push(queue, &task) != 0) {
             // 队列满时，等待一段时间再尝试
-            asm volatile("pause" ::: "memory"); // CPU友好等待
+            platform::cpu_relax();
         }
 
         if (i % 100 == 0) {
@@ -337,18 +366,29 @@ void* consume_thread(void* arg) {
 
     
     for(i = 0; i < MAX_Tasks; ++i) {
-        while(spsc_is_empty(queue)) {
-            // 等待队列非空
-            asm volatile("pause" ::: "memory"); // CPU友好等待
+        while (spsc_pop(queue, &task) != 0) {
+            // 队列为空时进行平台无关的让步等待
+            platform::cpu_relax();
+        }
+
+        if (task.task_id != i) {
+            fprintf(stderr, "任务ID校验失败: expected=%u, actual=%u\n", i, task.task_id);
         }
 
         for(unsigned int j = 0; j < TASK_DATA_SIZE; ++j) {
-            // 验证任务数据
-            task.data[j] = task.task_id * 10 + j;
+            // C++ 的显式类型转换 把表达式的值转换成std::uint64_t
+            const std::uint64_t expected = static_cast<std::uint64_t>(task.task_id) * 10 + j;
+            if (task.data[j] != expected) {
+                fprintf(stderr, "任务数据校验失败: id=%u, data[%u]=%llu, expected=%llu\n",
+                        task.task_id, j,
+                        static_cast<unsigned long long>(task.data[j]),
+                        static_cast<unsigned long long>(expected));
+            }
         }
 
         if (i % 100 == 0) {
-            printf("Consumed task %u with timestamp %llu\n", task.task_id, task.timestamp);
+            printf("Consumed task %u with timestamp %llu\n",
+                   task.task_id, static_cast<unsigned long long>(task.timestamp));
         }
     }
 
