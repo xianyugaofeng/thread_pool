@@ -1,4 +1,4 @@
-#include <cstdio>
+#include <iostream>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -80,7 +80,12 @@ class MemoryPool {
                 current->next = m_free_list;
             }
             m_free_list = start;  // 更新空闲链表头指针
-        };    
+            std::cout << "Preallocated " << num_blocks << " blocks (size: " << m_block_size 
+                      << "B), total pools: " << m_pools.size() << std::endl;
+        };
+        // 禁止拷贝构造和赋值操作
+        MemoryPool(const MemoryPool&) = delete;
+        MemoryPool& operator=(const MemoryPool&) = delete;
     private:
         size_t m_block_size;      // 内存块大小
         size_t m_align;           // 对齐方式
@@ -90,4 +95,65 @@ class MemoryPool {
 };
 
 
+class ThreadCache {
+    private:
+        struct FreeListNode {
+            FreeListNode *next;
+        };
+        // 小对象大小等级：8B、16B、...、4096B（共 512 个等级）
+        static const size_t kMaxSmallObjSize = 4096;
+        static const size_t k_align = 8;
+        static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
+        // 空闲链表数组: 每个索引对应一种大小的块
+        FreeListNode* m_free_lists[kFreeListCount] = {nullptr};
+    public:
+        // 分配内存
+        void* Allocate(size_t size) {
+            if (size > kMaxSmallObjSize) {
+                // 大对象直接向Page Cache申请
+                return CentralCache::Allocate(size);
+            }
+            size = AlignUp(size, k_align);  // 对齐到8B整数倍
+            size_t index = GetSizeIndex(size);
+            if (m_free_lists) {
+                // 空闲链表为空，从Central Cache批量申请内存块
+                FetchFromCentralCache(index, size);
+            }
+            FreeListNode* block = m_free_lists[0];
+            return block;
+        };
+        void Deallocate(void* ptr, size_t size);  // 释放内存
+    private:
+        // 计算大小对应的链表索引
+        size_t GetSizeIndex(size_t size) {
+            return (size + k_align - 1) / k_align - 1;  // 向上取整并减1得到索引
+        }
+        //向Central Cache批量申请内存块
+        void FetchFromCentralCache(size_t index, size_t size);
+        // 计算批量申请的块数（小对象多申请，大对象少申请）
+        size_t CalculateBatchSize(size_t size) {
+            if (size <= 64) return 32;
+            if (size <= 256) return 16;
+            if (size <= 1024) return 8;
+            return 4;
+        }
+};
 
+
+class CentralCache {
+    public:
+        void* Allocate(size_t size);
+};
+
+
+// 管理连续的物理页，分割为多个小块
+struct Span {
+    size_t page_id; // 起始页号
+    size_t page_count; // 页数量
+    size_t block_size; // 每个小块的大小
+    size_t free_count; // 空闲块数量
+    void* free_list; // 空闲块链表
+    Span* prev;  // 双向链表指针
+    Span* next; 
+    bool is_used;   // 是否被使用
+};
