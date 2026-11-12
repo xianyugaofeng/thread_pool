@@ -126,7 +126,7 @@ class ThreadCache {
     private:
         // 计算大小对应的链表索引
         size_t GetSizeIndex(size_t size) {
-            return (size + k_align - 1) / k_align - 1;  // 向上取整并减1得到索引
+            return AlignUp(size, k_align) / k_align - 1;  // 向上取整并减1得到索引
         }
         //向Central Cache批量申请内存块
         void FetchFromCentralCache(size_t index, size_t size);
@@ -156,4 +156,71 @@ struct Span {
     Span* prev;  // 双向链表指针
     Span* next; 
     bool is_used;   // 是否被使用
+};
+
+
+// SpanList：管理同大小等级的Span（双向链表）
+class SpanList {
+    public:
+        SpanList() : head_(new Span), tail_(new Span) {
+            head_->next = tail_;
+            tail_->prev = head_;
+        }
+        //插入尾部
+        void PushBack(Span* span) {
+            span->next = tail_;
+            span->prev = tail_->prev;
+            tail_->prev->next = span;
+            tail_->prev = span;
+        }
+        //弹出头部
+        Span* PopFront() {
+            if (head_->next = tail_) return nullptr;
+            Span* span = head_->next;
+            RemoveSpan(span);
+            return span;
+        }
+        // 移除指定Span
+        void RemoveSpan(Span* span) {
+            span->next->prev = span->prev;
+            span->prev->next = span->next;
+        }
+        bool Empty() const {
+            return head_->next == tail_;
+        }
+    private:
+        Span* head_;
+        Span* tail_;
+};
+
+
+//CentralCache单例模式
+class CentralCache {
+    private:
+        // 小对象大小等级：8B、16B、...、4096B（共 512 个等级）
+        static const size_t kMaxSmallObjSize = 4096;
+        static const size_t k_align = 8;
+        static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
+        SpanList span_lists_[kFreeListCount];   //SpanList数组
+        std::mutex mutexs[kFreeListCount];      //细粒度锁(每个等级一个锁)
+        CentralCache() = default;
+        CentralCache(const CentralCache&) = delete;
+        CentralCache& operator=(const CentralCache&) = delete;
+    public:
+        static CentralCache& GetInstance() {
+            static CentralCache instance;
+            return instance;
+        }
+        //批量申请块
+        void* AllocateBatch(size_t size, size_t batch_num);
+        //批量释放块
+        void* DeallocateBatch(size_t size, void* start, size_t count);
+        //计算大小所需要的索引
+        size_t GetSizeIndex(size_t size) const {
+            return AlignUp(size, k_align) / k_align - 1;
+        }
+        //批量向Page Cache申请内存页 创建Span
+        void FetchFromPageCache(size_t page_count);
+        //Span Split 构建空闲链表
+        void *SplitSpan(Span* span, size_t size, size_t batch_num);
 };
