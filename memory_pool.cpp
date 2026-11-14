@@ -1,9 +1,18 @@
 #include <iostream>
 #include <cstdlib>
-#include <cstring>
-#include <vector>
+#include <cstddef>
 #include <mutex>
-
+#include <thread>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
+#include <stdexcept>
+// 跨平台支持
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 inline size_t AlignUp(size_t size, size_t align) {
     return (size + align - 1) & ~(align - 1);
@@ -110,7 +119,7 @@ class ThreadCache {
         // 分配内存
         void* Allocate(size_t size) {
             if (size > kMaxSmallObjSize) {
-                // 大对象直接向Page Cache申请
+                // 大对象直接向Central Cache申请
                 return CentralCache::Allocate(size);
             }
             size = AlignUp(size, k_align);  // 对齐到8B整数倍
@@ -160,6 +169,7 @@ struct Span {
 
 
 // SpanList：管理同大小等级的Span（双向链表）
+// 每个SpanList对应一个互斥锁，避免不同大小等级的分配操作互相阻塞
 class SpanList {
     public:
         SpanList() : head_(new Span), tail_(new Span) {
@@ -201,7 +211,7 @@ class CentralCache {
         static const size_t kMaxSmallObjSize = 4096;
         static const size_t k_align = 8;
         static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
-        SpanList span_lists_[kFreeListCount];   //SpanList数组
+        SpanList m_span_lists[kFreeListCount];   //SpanList数组
         std::mutex mutexs[kFreeListCount];      //细粒度锁(每个等级一个锁)
         CentralCache() = default;
         CentralCache(const CentralCache&) = delete;
@@ -223,4 +233,31 @@ class CentralCache {
         void FetchFromPageCache(size_t page_count);
         //Span Split 构建空闲链表
         void *SplitSpan(Span* span, size_t size, size_t batch_num);
+};
+
+
+class PageCache {
+    private:
+        static const size_t kMaxPageCount = 128;   //最大支持128页
+        SpanList m_span_lists[kMaxPageCount + 1];   // 索引0未使用，1~128对应页数
+        std::mutex mutex_;      // 全局锁(竞争度小)
+        size_t m_page_size;     // 系统页的大小
+        std::unordered_map<size_t, Span*> page_id_to_span;      //页号到Span的映射
+        PageCache() : m_page_size(sysconf(_SC_PAGESIZE)) {};    //获取系统页大小
+        PageCache(const PageCache&) = delete;
+        PageCache& operator=(const PageCache&) = delete;
+    public:
+        static PageCache& GetInstance() {
+            static PageCache instance;
+            return instance;
+        }
+        Span* AllocatePages(size_t n);      // 申请n页
+        void DeallocatePages(Span* span);   // 归还Span
+        //根据地址找到对应的Span
+        Span* FindSpanByAddr(void* addr) {
+            size_t page_id = reinterpret_cast<size_t>(addr) / m_page_size;
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = page_id_to_span.find(page_id);
+            return it != page_id_to_span.end() ? it->second : nullptr;
+        }
 };
