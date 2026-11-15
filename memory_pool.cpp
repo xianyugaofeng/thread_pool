@@ -165,6 +165,8 @@ struct Span {
     Span* prev;  // 双向链表指针
     Span* next; 
     bool is_used;   // 是否被使用
+    Span(): page_id(0), page_count(0), block_size(0), free_count(0), 
+            free_list(nullptr), prev(nullptr), next(nullptr), is_used(false) {};
 };
 
 
@@ -175,6 +177,14 @@ class SpanList {
         SpanList() : head_(new Span), tail_(new Span) {
             head_->next = tail_;
             tail_->prev = head_;
+        }
+        ~SpanList() {
+            Span* cur = head_;
+            while (cur != nullptr) {
+                Span* next = cur->next;
+                delete cur;
+                cur = next;
+            }
         }
         //插入尾部
         void PushBack(Span* span) {
@@ -194,6 +204,8 @@ class SpanList {
         void RemoveSpan(Span* span) {
             span->next->prev = span->prev;
             span->prev->next = span->next;
+            span->prev = nullptr;
+            span->next = nullptr;
         }
         bool Empty() const {
             return head_->next == tail_;
@@ -243,7 +255,16 @@ class PageCache {
         std::mutex mutex_;      // 全局锁(竞争度小)
         size_t m_page_size;     // 系统页的大小
         std::unordered_map<size_t, Span*> page_id_to_span;      //页号到Span的映射
-        PageCache() : m_page_size(sysconf(_SC_PAGESIZE)) {};    //获取系统页大小
+        PageCache() {
+            //获取系统页大小
+            #ifdef _WIN32
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            m_page_size = si.dwPageSize;
+        #else
+            m_page_size = sysconf(_SC_PAGESIZE);
+        #endif    
+        }
         PageCache(const PageCache&) = delete;
         PageCache& operator=(const PageCache&) = delete;
     public:
@@ -251,13 +272,100 @@ class PageCache {
             static PageCache instance;
             return instance;
         }
-        Span* AllocatePages(size_t n);      // 申请n页
-        void DeallocatePages(Span* span);   // 归还Span
+        // 申请n页内存
+        Span* AllocatePages(size_t n) {
+            if (n == 0 || n > kMaxPageCount) {
+                throw std::bad_alloc();
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            // 1. 查找对应页数的SpanList
+            if (!m_span_lists[n].Empty()) {
+                Span* span = m_span_lists[n].PopFront();
+                for (size_t i = 0; i < span->page_count; ++i) {
+                    page_id_to_span[span->page_id + i] = span;
+                }
+                span->is_used = true;
+                return span;
+            }
+            // 2. 查找更大的Span，分割使用
+            for(size_t j = n + 1; j <= kMaxPageCount; ++j) {
+                if (!m_span_lists[j].Empty()) {
+                    Span* big_span = m_span_lists[j].PopFront();
+                    Span* small_span = new Span();
+                    small_span->page_count = n;
+                    small_span->page_id = big_span->page_id;
+                    // 剩余Span
+                    big_span->page_id = small_span->page_id + n;
+                    big_span->page_count -= n;
+                    m_span_lists[big_span->page_count].PushBack(big_span);
+                    //记录页号到Span的映射
+                    for(size_t k = 0; k < n; ++k) {
+                        page_id_to_span[small_span->page_id + k] = small_span;
+                    }
+                    small_span->is_used = true;
+                    return small_span;
+                }
+            }
+            // 3. 向系统申请内存
+            void* ptr = SystemAllocate(n);
+            if (!ptr) throw std::bad_alloc();
+            // 创建新Span
+            Span* span = new Span();
+            span->page_count = n;
+            span->page_id = reinterpret_cast<size_t>(ptr) / m_page_size;
+            // 记录页号映射
+            for(size_t i = 0; i < span->page_count; ++i) {
+                page_id_to_span[span->page_id + i] = span;
+            }
+            span->is_used = true;
+            return span;
+        };      
+        void DeallocatePages(Span* span) {
+            if (!span || !span->is_used) return;
+            std::lock_guard<std::mutex> lock(mutex_);
+            span->is_used = false;
+            span->free_count = 0;
+            span->free_list = nullptr;
+            //合并相邻Span
+            MergeSpan(span);
+            //超过最大物理页数，选择向系统释放部分内存
+            if (span->page_count > kMaxPageCount) {
+                SystemDeallocate(span, kMaxPageCount - span->page_count);
+                span->page_count = kMaxPageCount;
+            }
+            m_span_lists[span->page_count].PushBack(span);
+            //移除页号映射
+            for(size_t i = 0; i < span->page_count; ++i) {
+                page_id_to_span[span->page_id + i] == nullptr;
+            }
+        };   // 归还Span
         //根据地址找到对应的Span
         Span* FindSpanByAddr(void* addr) {
             size_t page_id = reinterpret_cast<size_t>(addr) / m_page_size;
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = page_id_to_span.find(page_id);
             return it != page_id_to_span.end() ? it->second : nullptr;
+        }
+    private:
+        //合并Span与前后相邻的空闲Span
+        void MergeSpan(Span* span);
+        //向系统申请n页内存(mmap实现)
+        void* SystemAllocate(size_t n) {
+            //封装系统内存分配接口，通过条件编译适配不同平台
+            size_t total_size = n * m_page_size;
+            #ifdef _WIN32
+                return VirtualAlloc(nullptr, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            #else
+                void* ptr = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (ptr == MAP_FAILED) return nullptr;
+            #endif
+        }
+        //向系统释放内存munmap实现
+        void SystemDeallocate(void* ptr, size_t n) {
+            #ifdef _WIN32
+                VirtualFree(ptr, 0, MEM_RELEASE);
+            #else
+                munmap(ptr, total_size);
+            #endif
         }
 };
