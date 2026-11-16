@@ -320,6 +320,7 @@ class PageCache {
             span->is_used = true;
             return span;
         };      
+        // 归还Span
         void DeallocatePages(Span* span) {
             if (!span || !span->is_used) return;
             std::lock_guard<std::mutex> lock(mutex_);
@@ -338,17 +339,54 @@ class PageCache {
             for(size_t i = 0; i < span->page_count; ++i) {
                 page_id_to_span[span->page_id + i] == nullptr;
             }
-        };   // 归还Span
+        };   
         //根据地址找到对应的Span
         Span* FindSpanByAddr(void* addr) {
+            if (!addr) return nullptr;
             size_t page_id = reinterpret_cast<size_t>(addr) / m_page_size;
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = page_id_to_span.find(page_id);
             return it != page_id_to_span.end() ? it->second : nullptr;
         }
+        size_t GetPageSize() const { return m_page_size; }
     private:
         //合并Span与前后相邻的空闲Span
-        void MergeSpan(Span* span);
+        void MergeSpan(Span* span) {
+            //合并前一个Span
+            size_t prev_page_id = span->page_id - 1;
+            auto prev_it = page_id_to_span.find(prev_page_id);
+            if (prev_it != page_id_to_span.end()) {
+                Span* prev_span = prev_it->second;
+                if (!prev_span->is_used && prev_span->page_id + prev_span->page_count == span->page_id) {
+                    //从SpanList中移除Span
+                    m_span_lists[span->page_count].RemoveSpan(span);
+                    //合并Span
+                    prev_span->page_count += span->page_count;
+                    delete span;
+                    span = prev_span;
+                    //更新页号映射
+                    for (size_t i = 0; i < span->page_count; ++i) {
+                        page_id_to_span[span->page_id + i] = span;
+                    }
+                }
+            }
+            //合并后一个Span
+            size_t next_page_id = span->page_id + span->page_count;
+            auto next_it = page_id_to_span.find(next_page_id);
+            if (next_it != page_id_to_span.end()) {
+                Span* next_span = next_it->second;
+                if (!next_span->is_used && span->page_id + span->page_count == next_span->page_id) {
+                    //从SpanList中移除Span
+                    m_span_lists[next_span->page_count].RemoveSpan(next_span);
+                    //合并Span
+                    span->page_count += next_span->page_count;
+                    delete next_span;
+                    for (size_t i = 0; i < span->page_count; ++i) {
+                        page_id_to_span[span->page_id + i] = span;
+                    }
+                }
+            }
+        };
         //向系统申请n页内存(mmap实现)
         void* SystemAllocate(size_t n) {
             //封装系统内存分配接口，通过条件编译适配不同平台
