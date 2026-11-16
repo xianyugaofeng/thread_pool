@@ -11,6 +11,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -392,17 +393,25 @@ class PageCache {
             //封装系统内存分配接口，通过条件编译适配不同平台
             size_t total_size = n * m_page_size;
             #ifdef _WIN32
+                //nullptr: 让系统选择地址
+                //total_size: 申请字节数，系统会向上对齐到页边界
+                //MEM_COMMIT | MEM_RESERVE: 同时保留地址空间并提交物理页，返回的内存可直接读写
+                //PAGE_READWRITE：可读可写
+                //成功返回页对齐地址，失败返回nullptr
                 return VirtualAlloc(nullptr, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             #else
                 void* ptr = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (ptr == MAP_FAILED) return nullptr;
+                return ptr;
             #endif
         }
         //向系统释放内存munmap实现
         void SystemDeallocate(void* ptr, size_t n) {
             #ifdef _WIN32
+                //MEM_RELEASE：释放整个保留区域，地址空间和物理页一起归还。
                 VirtualFree(ptr, 0, MEM_RELEASE);
             #else
+                size_t total_size = n * m_page_size;
                 munmap(ptr, total_size);
             #endif
         }
