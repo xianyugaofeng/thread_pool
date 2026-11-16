@@ -150,12 +150,6 @@ class ThreadCache {
 };
 
 
-class CentralCache {
-    public:
-        void* Allocate(size_t size);
-};
-
-
 // 管理连续的物理页，分割为多个小块
 struct Span {
     size_t page_id; // 起始页号
@@ -211,7 +205,6 @@ class SpanList {
         bool Empty() const {
             return head_->next == tail_;
         }
-    private:
         Span* head_;
         Span* tail_;
 };
@@ -234,18 +227,63 @@ class CentralCache {
             static CentralCache instance;
             return instance;
         }
-        //批量申请块
-        void* AllocateBatch(size_t size, size_t batch_num);
+        //批量申请内存块
+        void* AllocateBatch(size_t size, size_t batch_num) {
+            if (size == 0 || batch_num == 0 || size > kMaxSmallObjSize) {
+                return nullptr;
+            }
+            size_t align_size = AlignUp(size, k_align);
+            size_t index = align_size / k_align - 1;
+            std::lock_guard<std::mutex> lock(mutexs[index]);
+            //查找有空闲块的Span
+            Span* span = nullptr;
+            for(Span* cur = m_span_lists[index].head_->next; cur != m_span_lists[index].tail_; cur=cur->next) {
+                if (cur->free_count > 0) {
+                    span = cur;
+                    break;
+                }
+            }
+            //没有可用Span，向Page Cache申请
+            if (!span) {
+                size_t page_count = (align_size * batch_num + PageCache::GetInstance().GetPageSize() - 1) / PageCache::GetInstance().GetPageSize();
+                page_count = std::max(page_count, static_cast<size_t>(1));
+                Span* new_span = PageCache::GetInstance().AllocatePages(page_count);
+                new_span->block_size = align_size;
+                new_span->free_count = page_count * PageCache::GetInstance().GetPageSize() / align_size;
+                //分割Span为小块，构建空闲链表
+                new_span = SplitSpan(new_span, align_size);
+                //将新Span插入SpanList
+                m_span_lists[index].PushBack(new_span);
+                span = new_span;
+            }
+            //从Span中取出batch_num个块
+            void* start = span->free_list;
+            void* end = start;
+            size_t actual_num = std::min(batch_num, span->free_count);
+            for(size_t i = 0; i < actual_num; ++i) {
+                *reinterpret_cast<void**>(end) += align_size;
+            }
+            //更新Span的空闲链表
+            span->free_list = *reinterpret_cast<void**>(end);
+            *reinterpret_cast<void**>(end) = nullptr;
+            span->free_count -= actual_num;
+            return start;
+        };
         //批量释放块
         void* DeallocateBatch(size_t size, void* start, size_t count);
-        //计算大小所需要的索引
-        size_t GetSizeIndex(size_t size) const {
-            return AlignUp(size, k_align) / k_align - 1;
-        }
-        //批量向Page Cache申请内存页 创建Span
-        void FetchFromPageCache(size_t page_count);
         //Span Split 构建空闲链表
-        void *SplitSpan(Span* span, size_t size, size_t batch_num);
+        Span* SplitSpan(Span* span, size_t align_size) {
+            char* start = reinterpret_cast<char*>(span->page_id * PageCache::GetInstance().GetPageSize());
+            char* end = start + PageCache::GetInstance().GetPageSize() * span->page_id;
+            char *cur = start;
+            span->free_list = start;
+            while(cur + align_size > end) {
+                *reinterpret_cast<char**>(cur) += align_size;
+                cur += align_size;
+            }
+            *reinterpret_cast<char**>(cur) = nullptr;
+            return span;
+        };
 };
 
 
