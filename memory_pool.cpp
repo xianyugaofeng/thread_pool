@@ -139,17 +139,74 @@ class ThreadCache {
             FreeListNode* node = m_free_lists[index];
             m_free_lists[index] = node->next;
             return node;
-        };
-        void Deallocate(void* ptr, size_t size);  // 释放内存
+        }
+        // 释放内存
+        void Deallocate(void* ptr, size_t size) {
+            if (!ptr || size == 0) return;
+            // 大对象直接归还给PageCache
+            if (size > kMaxSmallObjSize) {
+                Span* span = PageCache::GetInstance().FindSpanByAddr(ptr);
+                if (span) {
+                    PageCache::GetInstance().DeallocatePages(span);
+                    return;
+                }
+            }
+            size_t align_size = AlignUp(size, k_align);
+            size_t index = align_size / k_align - 1;
+            //插入空闲链表
+            FreeListNode* node = static_cast<FreeListNode*>(ptr);
+            node->next = m_free_lists[index];
+            m_free_lists[index] = node;
+            //空闲链表过长，归还给Central Cache
+            size_t batch_num = CalculateBatchNum(align_size);
+            if (GetListLength(m_free_lists[index]) > 2 * batch_num) {
+                ReleaseToCentralCache(index, align_size, batch_num);
+            }
+        }
     private:
+        size_t GetListLength(FreeListNode* head) {
+            size_t len = 0;
+            while(head) {
+                len++;
+                head = head->next;
+            }
+            return len;
+        }
         //向Central Cache批量申请内存块
-        void FetchFromCentralCache(size_t index, size_t size);
+        void FetchFromCentralCache(size_t index, size_t size) {
+            size_t batch_num = CalculateBatchNum(size);
+            void* start = CentralCache::GetInstance().AllocateBatch(size, batch_num);
+            if(!start) throw std::bad_alloc();
+            FreeListNode* cur = static_cast<FreeListNode*>(start);
+            FreeListNode* end = cur;
+            for(size_t i = 0; i < batch_num - 1; ++i) {
+                end = end->next;
+            }
+            end->next = m_free_lists[index];
+            m_free_lists[index] = cur; 
+        };
         // 计算批量申请的块数（小对象多申请，大对象少申请）
-        size_t CalculateBatchSize(size_t size) {
+        size_t CalculateBatchNum(size_t size) const {
             if (size <= 64) return 32;
             if (size <= 256) return 16;
             if (size <= 1024) return 8;
             return 4;
+        }
+        // 归还给Central Cache
+        void ReleaseToCentralCache(size_t index, size_t size, size_t batch_num) {
+            FreeListNode* cur = m_free_lists[index];
+            if (!cur) return;
+            // 取出batch_num个块
+            FreeListNode* end = cur;
+            for (size_t i = 0; i < batch_num - 1 && end; ++i) {
+                end = end->next;
+            }
+            if (!end) return;
+            //更新空闲链表
+            m_free_lists[index] = end->next;
+            end->next = nullptr;
+            //归还给CentralCache
+            CentralCache::GetInstance().DeallocateBatch(size, cur, batch_num);
         }
 };
 
@@ -478,3 +535,6 @@ class PageCache {
             #endif
         }
 };
+
+
+// 线程本地存储：每个线程独立的ThreadCache
