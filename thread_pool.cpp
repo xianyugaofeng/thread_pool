@@ -8,6 +8,7 @@
 #include <new>
 #include <pthread.h>
 #include <chrono>
+#include <thread>
 
 
 class ThreadPool {
@@ -107,7 +108,7 @@ bool ThreadPool::init(int numWorkers, int max_jobs) {
         m_workers[i].pool = this;
         //int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);
         //pthread_t* 输出参数，创建成功后线程ID写回这里
-        //const pthread_attr_t*	线程属性，NULL=默认（joinable、默认栈大小、默认调度）
+        //const pthread_attr_t*线程属性，NULL=默认（joinable、默认栈大小、默认调度）
         //线程入口函数，新线程从这里开始执行
         //NWorker* → 隐式转void* 传给入口函数的参数指针，原样出现在_run(void *arg)里
         int ret = pthread_create(&(m_workers[i].threadid), NULL, _run, &m_workers[i]);
@@ -273,7 +274,6 @@ int ThreadPool::pushJob(void (*func)(void *), void *arg, int len) {
 
     return 1;
 }
-#endif
 
 static void task(void *args) {
     int n = *(int *)args;
@@ -302,4 +302,4 @@ int main() {
     printf("shutting down...\n");
     return 0;
 }
-
+#endif
