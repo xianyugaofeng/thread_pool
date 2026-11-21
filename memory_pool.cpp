@@ -20,6 +20,66 @@ inline size_t AlignUp(size_t size, size_t align) {
 }
 
 
+// 管理连续的物理页，分割为多个小块
+struct Span {
+    size_t page_id; // 起始页号
+    size_t page_count; // 页数量
+    size_t block_size; // 每个小块的大小
+    size_t free_count; // 空闲块数量
+    void* free_list; // 空闲块链表
+    Span* prev;  // 双向链表指针
+    Span* next; 
+    bool is_used;   // 是否被使用
+    Span(): page_id(0), page_count(0), block_size(0), free_count(0), 
+            free_list(nullptr), prev(nullptr), next(nullptr), is_used(false) {};
+};
+
+
+// SpanList：管理同大小等级的Span（双向链表）
+// 每个SpanList对应一个互斥锁，避免不同大小等级的分配操作互相阻塞
+class SpanList {
+    public:
+        SpanList() : head_(new Span), tail_(new Span) {
+            head_->next = tail_;
+            tail_->prev = head_;
+        }
+        ~SpanList() {
+            Span* cur = head_;
+            while (cur != nullptr) {
+                Span* next = cur->next;
+                delete cur;
+                cur = next;
+            }
+        }
+        //插入尾部
+        void PushBack(Span* span) {
+            span->next = tail_;
+            span->prev = tail_->prev;
+            tail_->prev->next = span;
+            tail_->prev = span;
+        }
+        //弹出头部
+        Span* PopFront() {
+            if (head_->next == tail_) return nullptr;
+            Span* span = head_->next;
+            RemoveSpan(span);
+            return span;
+        }
+        // 移除指定Span
+        void RemoveSpan(Span* span) {
+            span->next->prev = span->prev;
+            span->prev->next = span->next;
+            span->prev = nullptr;
+            span->next = nullptr;
+        }
+        bool Empty() const {
+            return head_->next == tail_;
+        }
+        Span* head_;
+        Span* tail_;
+};
+
+
 class MemoryPool {
     private:
         // 空闲块结构（嵌入式链表，无额外内存开销）
@@ -27,9 +87,11 @@ class MemoryPool {
         struct FreeBlock {
             FreeBlock *next;
         };
+        FreeBlock* m_free_list;   // 空闲块链表头指针
+        size_t m_block_size;      // 内存块大小
     public:
         explicit MemoryPool(size_t block_size, size_t align = 8, size_t prealloc = 1024)
-            : m_align(align), m_free_list(nullptr), m_block_size(block_size) {
+            : m_free_list(nullptr), m_block_size(block_size), m_align(align) {
             // 块大小向上对齐到align整数倍
             m_block_size = AlignUp(m_block_size, m_align);
             // 预分配第一批块
@@ -97,274 +159,9 @@ class MemoryPool {
         MemoryPool(const MemoryPool&) = delete;
         MemoryPool& operator=(const MemoryPool&) = delete;
     private:
-        size_t m_block_size;      // 内存块大小
         size_t m_align;           // 对齐方式
-        FreeBlock *m_free_list;   // 空闲块链表头指针
         std::vector<void*> m_pools;  // 已分配的内存块列表(用于折构时释放)
         std::mutex m_mutex;  // 互斥锁，保护空闲块链表
-};
-
-
-class ThreadCache {
-    private:
-        struct FreeListNode {
-            FreeListNode *next;
-        };
-        // 小对象大小等级：8B、16B、...、4096B（共 512 个等级）
-        static const size_t kMaxSmallObjSize = 4096;
-        static const size_t k_align = 8;
-        static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
-        // 空闲链表数组: 每个索引对应一种大小的块
-        FreeListNode* m_free_lists[kFreeListCount] = {nullptr};
-    public:
-        // 分配内存
-        void* Allocate(size_t size) {
-            if (size == 0) return nullptr;
-            if (size > kMaxSmallObjSize) {
-                // 大对象直接向Page Cache申请
-                size_t page_count = (size + PageCache::GetInstance().GetPageSize() - 1) / PageCache::GetInstance().GetPageSize();
-                Span* span = PageCache::GetInstance().AllocatePages(page_count);
-                return reinterpret_cast<void*>(span->page_id * PageCache::GetInstance().GetPageSize());
-            }
-            size_t align_size = AlignUp(size, k_align);  // 对齐到8B整数倍
-            size_t index = align_size / k_align - 1;;
-            if (m_free_lists[index]) {
-                FreeListNode* node = m_free_lists[index];
-                m_free_lists[index] = node->next;
-                return node;
-            }
-            // 空闲链表为空，从Central Cache批量申请内存块
-            FetchFromCentralCache(index, align_size);
-            // 再次分配
-            FreeListNode* node = m_free_lists[index];
-            m_free_lists[index] = node->next;
-            return node;
-        }
-        // 释放内存
-        void Deallocate(void* ptr, size_t size) {
-            if (!ptr || size == 0) return;
-            // 大对象直接归还给PageCache
-            if (size > kMaxSmallObjSize) {
-                Span* span = PageCache::GetInstance().FindSpanByAddr(ptr);
-                if (span) {
-                    PageCache::GetInstance().DeallocatePages(span);
-                    return;
-                }
-            }
-            size_t align_size = AlignUp(size, k_align);
-            size_t index = align_size / k_align - 1;
-            //插入空闲链表
-            FreeListNode* node = static_cast<FreeListNode*>(ptr);
-            node->next = m_free_lists[index];
-            m_free_lists[index] = node;
-            //空闲链表过长，归还给Central Cache
-            size_t batch_num = CalculateBatchNum(align_size);
-            if (GetListLength(m_free_lists[index]) > 2 * batch_num) {
-                ReleaseToCentralCache(index, align_size, batch_num);
-            }
-        }
-    private:
-        size_t GetListLength(FreeListNode* head) {
-            size_t len = 0;
-            while(head) {
-                len++;
-                head = head->next;
-            }
-            return len;
-        }
-        //向Central Cache批量申请内存块
-        void FetchFromCentralCache(size_t index, size_t size) {
-            size_t batch_num = CalculateBatchNum(size);
-            void* start = CentralCache::GetInstance().AllocateBatch(size, batch_num);
-            if(!start) throw std::bad_alloc();
-            FreeListNode* cur = static_cast<FreeListNode*>(start);
-            FreeListNode* end = cur;
-            for(size_t i = 0; i < batch_num - 1; ++i) {
-                end = end->next;
-            }
-            end->next = m_free_lists[index];
-            m_free_lists[index] = cur; 
-        };
-        // 计算批量申请的块数（小对象多申请，大对象少申请）
-        size_t CalculateBatchNum(size_t size) const {
-            if (size <= 64) return 32;
-            if (size <= 256) return 16;
-            if (size <= 1024) return 8;
-            return 4;
-        }
-        // 归还给Central Cache
-        void ReleaseToCentralCache(size_t index, size_t size, size_t batch_num) {
-            FreeListNode* cur = m_free_lists[index];
-            if (!cur) return;
-            // 取出batch_num个块
-            FreeListNode* end = cur;
-            for (size_t i = 0; i < batch_num - 1 && end; ++i) {
-                end = end->next;
-            }
-            if (!end) return;
-            //更新空闲链表
-            m_free_lists[index] = end->next;
-            end->next = nullptr;
-            //归还给CentralCache
-            CentralCache::GetInstance().DeallocateBatch(size, cur, batch_num);
-        }
-};
-
-
-// 管理连续的物理页，分割为多个小块
-struct Span {
-    size_t page_id; // 起始页号
-    size_t page_count; // 页数量
-    size_t block_size; // 每个小块的大小
-    size_t free_count; // 空闲块数量
-    void* free_list; // 空闲块链表
-    Span* prev;  // 双向链表指针
-    Span* next; 
-    bool is_used;   // 是否被使用
-    Span(): page_id(0), page_count(0), block_size(0), free_count(0), 
-            free_list(nullptr), prev(nullptr), next(nullptr), is_used(false) {};
-};
-
-
-// SpanList：管理同大小等级的Span（双向链表）
-// 每个SpanList对应一个互斥锁，避免不同大小等级的分配操作互相阻塞
-class SpanList {
-    public:
-        SpanList() : head_(new Span), tail_(new Span) {
-            head_->next = tail_;
-            tail_->prev = head_;
-        }
-        ~SpanList() {
-            Span* cur = head_;
-            while (cur != nullptr) {
-                Span* next = cur->next;
-                delete cur;
-                cur = next;
-            }
-        }
-        //插入尾部
-        void PushBack(Span* span) {
-            span->next = tail_;
-            span->prev = tail_->prev;
-            tail_->prev->next = span;
-            tail_->prev = span;
-        }
-        //弹出头部
-        Span* PopFront() {
-            if (head_->next = tail_) return nullptr;
-            Span* span = head_->next;
-            RemoveSpan(span);
-            return span;
-        }
-        // 移除指定Span
-        void RemoveSpan(Span* span) {
-            span->next->prev = span->prev;
-            span->prev->next = span->next;
-            span->prev = nullptr;
-            span->next = nullptr;
-        }
-        bool Empty() const {
-            return head_->next == tail_;
-        }
-        Span* head_;
-        Span* tail_;
-};
-
-
-//CentralCache单例模式
-class CentralCache {
-    private:
-        // 小对象大小等级：8B、16B、...、4096B（共 512 个等级）
-        static const size_t kMaxSmallObjSize = 4096;
-        static const size_t k_align = 8;
-        static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
-        SpanList m_span_lists[kFreeListCount];   //SpanList数组
-        std::mutex mutexs[kFreeListCount];      //细粒度锁(每个等级一个锁)
-        CentralCache() = default;
-        CentralCache(const CentralCache&) = delete;
-        CentralCache& operator=(const CentralCache&) = delete;
-    public:
-        static CentralCache& GetInstance() {
-            static CentralCache instance;
-            return instance;
-        }
-        //批量申请内存块
-        void* AllocateBatch(size_t size, size_t batch_num) {
-            if (size == 0 || batch_num == 0 || size > kMaxSmallObjSize) {
-                return nullptr;
-            }
-            size_t align_size = AlignUp(size, k_align);
-            size_t index = align_size / k_align - 1;
-            std::lock_guard<std::mutex> lock(mutexs[index]);
-            //查找有空闲块的Span
-            Span* span = nullptr;
-            for(Span* cur = m_span_lists[index].head_->next; cur != m_span_lists[index].tail_; cur=cur->next) {
-                if (cur->free_count > 0) {
-                    span = cur;
-                    break;
-                }
-            }
-            //没有可用Span，向Page Cache申请
-            if (!span) {
-                size_t page_count = (align_size * batch_num + PageCache::GetInstance().GetPageSize() - 1) / PageCache::GetInstance().GetPageSize();
-                page_count = std::max(page_count, static_cast<size_t>(1));
-                Span* new_span = PageCache::GetInstance().AllocatePages(page_count);
-                new_span->block_size = align_size;
-                new_span->free_count = page_count * PageCache::GetInstance().GetPageSize() / align_size;
-                //分割Span为小块，构建空闲链表
-                new_span = SplitSpan(new_span, align_size);
-                //将新Span插入SpanList
-                m_span_lists[index].PushBack(new_span);
-                span = new_span;
-            }
-            //从Span中取出batch_num个块
-            void* start = span->free_list;
-            void* end = start;
-            size_t actual_num = std::min(batch_num, span->free_count);
-            for(size_t i = 0; i < actual_num; ++i) {
-                *reinterpret_cast<void**>(end) += align_size;
-            }
-            //更新Span的空闲链表
-            span->free_list = *reinterpret_cast<void**>(end);
-            *reinterpret_cast<void**>(end) = nullptr;
-            span->free_count -= actual_num;
-            return start;
-        };
-        //批量归还内存块
-        void* DeallocateBatch(size_t size, void* start, size_t count) {
-            if (!start || size == 0 || count == 0 || size > kMaxSmallObjSize) {
-                return;
-            }
-            size_t align_size = AlignUp(size, k_align);
-            size_t index = (align_size / k_align) - 1;
-            std::lock_guard<std::mutex> lock(mutexs[index]);
-            //找到对应的Span
-            Span* span = PageCache::GetInstance().FindSpanByAddr(start);
-            if (!span) return;
-            // 将块插入该Span的空闲链表
-            *reinterpret_cast<void**>(reinterpret_cast<char*>(start) + (count - 1) * align_size) = span->free_list;
-            span->free_list = start;
-            span->free_count += count;
-            // 所有块都空闲，构建空闲链表
-            size_t total_blocks = (span->page_count * PageCache::GetInstance().GetPageSize()) / align_size;
-            if (span->free_count == total_blocks) {
-                m_span_lists[index].RemoveSpan(span);
-                PageCache::GetInstance().DeallocatePages(span);
-            }
-        };
-        //Span Split 构建空闲链表
-        Span* SplitSpan(Span* span, size_t align_size) {
-            char* start = reinterpret_cast<char*>(span->page_id * PageCache::GetInstance().GetPageSize());
-            char* end = start + PageCache::GetInstance().GetPageSize() * span->page_id;
-            char *cur = start;
-            span->free_list = start;
-            while(cur + align_size > end) {
-                *reinterpret_cast<char**>(cur) += align_size;
-                cur += align_size;
-            }
-            *reinterpret_cast<char**>(cur) = nullptr;
-            return span;
-        };
 };
 
 
@@ -451,7 +248,7 @@ class PageCache {
             MergeSpan(span);
             //超过最大物理页数，选择向系统释放部分内存
             if (span->page_count > kMaxPageCount) {
-                SystemDeallocate(span, kMaxPageCount - span->page_count);
+                SystemDeallocate(span);
                 span->page_count = kMaxPageCount;
             }
             m_span_lists[span->page_count].PushBack(span);
@@ -525,16 +322,307 @@ class PageCache {
             #endif
         }
         //向系统释放内存munmap实现
-        void SystemDeallocate(void* ptr, size_t n) {
+        void SystemDeallocate(void* ptr) {
             #ifdef _WIN32
                 //MEM_RELEASE：释放整个保留区域，地址空间和物理页一起归还。
                 VirtualFree(ptr, 0, MEM_RELEASE);
-            #else
-                size_t total_size = n * m_page_size;
-                munmap(ptr, total_size);
             #endif
         }
 };
 
 
+//CentralCache单例模式
+class CentralCache {
+    private:
+        // 小对象大小等级：8B、16B、...、4096B（共 512 个等级）
+        static const size_t kMaxSmallObjSize = 4096;
+        static const size_t k_align = 8;
+        static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
+        SpanList m_span_lists[kFreeListCount];   //SpanList数组
+        std::mutex mutexs[kFreeListCount];      //细粒度锁(每个等级一个锁)
+        CentralCache() = default;
+        CentralCache(const CentralCache&) = delete;
+        CentralCache& operator=(const CentralCache&) = delete;
+    public:
+        static CentralCache& GetInstance() {
+            static CentralCache instance;
+            return instance;
+        }
+        //批量申请内存块
+        void* AllocateBatch(size_t size, size_t batch_num) {
+            if (size == 0 || batch_num == 0 || size > kMaxSmallObjSize) {
+                return nullptr;
+            }
+            size_t align_size = AlignUp(size, k_align);
+            size_t index = align_size / k_align - 1;
+            std::lock_guard<std::mutex> lock(mutexs[index]);
+            //查找有空闲块的Span
+            Span* span = nullptr;
+            for(Span* cur = m_span_lists[index].head_->next; cur != m_span_lists[index].tail_; cur=cur->next) {
+                if (cur->free_count > 0) {
+                    span = cur;
+                    break;
+                }
+            }
+            //没有可用Span，向Page Cache申请
+            if (!span) {
+                size_t page_count = (align_size * batch_num + PageCache::GetInstance().GetPageSize() - 1) / PageCache::GetInstance().GetPageSize();
+                page_count = std::max(page_count, static_cast<size_t>(1));
+                Span* new_span = PageCache::GetInstance().AllocatePages(page_count);
+                new_span->block_size = align_size;
+                new_span->free_count = page_count * PageCache::GetInstance().GetPageSize() / align_size;
+                //分割Span为小块，构建空闲链表
+                SplitSpan(new_span, align_size);
+                //将新Span插入SpanList
+                m_span_lists[index].PushBack(new_span);
+                span = new_span;
+            }
+            //从Span中取出batch_num个块
+            void* start = span->free_list;
+            void* end = start;
+            size_t actual_num = std::min(batch_num, span->free_count);
+            for(size_t i = 0; i < actual_num - 1 && end; ++i) {
+                end = *reinterpret_cast<void**>(end);
+            }
+            //更新Span的空闲链表
+            if (end) {
+                span->free_list = *reinterpret_cast<char**>(end);
+                *reinterpret_cast<char**>(end) = nullptr;
+            } else {
+                span->free_list = nullptr;
+            }
+            span->free_count -= actual_num;
+            return start;
+        };
+        //批量归还内存块
+        void DeallocateBatch(size_t size, void* start, size_t count) {
+            if (!start || size == 0 || count == 0 || size > kMaxSmallObjSize) {
+                return;
+            }
+            size_t align_size = AlignUp(size, k_align);
+            size_t index = (align_size / k_align) - 1;
+            std::lock_guard<std::mutex> lock(mutexs[index]);
+            //找到对应的Span
+            Span* span = PageCache::GetInstance().FindSpanByAddr(start);
+            if (!span) return;
+            // 将块插入该Span的空闲链表
+            *reinterpret_cast<void**>(reinterpret_cast<char*>(start) + (count - 1) * align_size) = span->free_list;
+            span->free_list = start;
+            span->free_count += count;
+            // 所有块都空闲，构建空闲链表
+            size_t total_blocks = (span->page_count * PageCache::GetInstance().GetPageSize()) / align_size;
+            if (span->free_count == total_blocks) {
+                m_span_lists[index].RemoveSpan(span);
+                PageCache::GetInstance().DeallocatePages(span);
+            }
+        };
+        //Span Split 构建空闲链表
+        void SplitSpan(Span* span, size_t align_size) {
+            size_t page_size = PageCache::GetInstance().GetPageSize();
+            char* start = reinterpret_cast<char*>(span->page_id * page_size);
+            char* end = reinterpret_cast<char*>(start + page_size * span->page_count);
+            char *cur = start;
+            while(cur + align_size < end) {
+                *reinterpret_cast<char**>(cur) = reinterpret_cast<char*>(cur) + align_size;
+                cur += align_size;
+            }
+            *reinterpret_cast<char**>(cur) = nullptr;
+            span->free_list = start;
+        };
+};
+
+
+class ThreadCache {
+    private:
+        struct FreeListNode {
+            FreeListNode *next;
+        };
+        // 小对象大小等级：8B、16B、...、4096B（共 512 个等级）
+        static const size_t kMaxSmallObjSize = 4096;
+        static const size_t k_align = 8;
+        static const size_t kFreeListCount = kMaxSmallObjSize / k_align;
+        // 空闲链表数组: 每个索引对应一种大小的块
+        FreeListNode* m_free_lists[kFreeListCount] = {nullptr};
+    public:
+        // 分配内存
+        void* Allocate(size_t size) {
+            if (size == 0) return nullptr;
+            if (size > kMaxSmallObjSize) {
+                // 大对象直接向Page Cache申请
+                size_t page_count = (size + PageCache::GetInstance().GetPageSize() - 1) / PageCache::GetInstance().GetPageSize();
+                Span* span = PageCache::GetInstance().AllocatePages(page_count);
+                return reinterpret_cast<void*>(span->page_id * PageCache::GetInstance().GetPageSize());
+            }
+            size_t align_size = AlignUp(size, k_align);  // 对齐到8B整数倍
+            size_t index = align_size / k_align - 1;;
+            if (m_free_lists[index]) {
+                FreeListNode* node = m_free_lists[index];
+                m_free_lists[index] = node->next;
+                return node;
+            }
+            // 空闲链表为空，从Central Cache批量申请内存块
+            FetchFromCentralCache(index, align_size);
+            // 再次分配
+            FreeListNode* node = m_free_lists[index];
+            if (!node) {
+                throw std::bad_alloc();
+            }
+            m_free_lists[index] = node->next;
+            return node;
+        }
+        // 释放内存
+        void Deallocate(void* ptr, size_t size) {
+            if (!ptr || size == 0) return;
+            // 大对象直接归还给PageCache
+            if (size > kMaxSmallObjSize) {
+                Span* span = PageCache::GetInstance().FindSpanByAddr(ptr);
+                if (span) {
+                    PageCache::GetInstance().DeallocatePages(span);
+                    return;
+                }
+            }
+            size_t align_size = AlignUp(size, k_align);
+            size_t index = align_size / k_align - 1;
+            //插入空闲链表
+            FreeListNode* node = static_cast<FreeListNode*>(ptr);
+            node->next = m_free_lists[index];
+            m_free_lists[index] = node;
+            //空闲链表过长，归还给Central Cache
+            size_t batch_num = CalculateBatchNum(align_size);
+            if (GetListLength(m_free_lists[index]) > 2 * batch_num) {
+                ReleaseToCentralCache(index, align_size, batch_num);
+            }
+        }
+    private:
+        size_t GetListLength(FreeListNode* head) {
+            size_t len = 0;
+            while(head) {
+                len++;
+                head = head->next;
+            }
+            return len;
+        }
+        //向Central Cache批量申请内存块
+        void FetchFromCentralCache(size_t index, size_t size) {
+            size_t batch_num = CalculateBatchNum(size);
+            void* start = CentralCache::GetInstance().AllocateBatch(size, batch_num);
+            if(!start) throw std::bad_alloc();
+            FreeListNode* cur = static_cast<FreeListNode*>(start);
+            FreeListNode* end = cur;
+            for(size_t i = 0; i < batch_num - 1; ++i) {
+                end = end->next;
+            }
+            end->next = m_free_lists[index];
+            m_free_lists[index] = cur; 
+        };
+        // 计算批量申请的块数（小对象多申请，大对象少申请）
+        size_t CalculateBatchNum(size_t size) const {
+            if (size <= 64) return 32;
+            if (size <= 256) return 16;
+            if (size <= 1024) return 8;
+            return 4;
+        }
+        // 归还给Central Cache
+        void ReleaseToCentralCache(size_t index, size_t size, size_t batch_num) {
+            FreeListNode* cur = m_free_lists[index];
+            if (!cur) return;
+            // 取出batch_num个块
+            FreeListNode* end = cur;
+            for (size_t i = 0; i < batch_num - 1 && end; ++i) {
+                end = end->next;
+            }
+            if (!end) return;
+            //更新空闲链表
+            m_free_lists[index] = end->next;
+            end->next = nullptr;
+            //归还给CentralCache
+            CentralCache::GetInstance().DeallocateBatch(size, cur, batch_num);
+        }
+};
+
+
 // 线程本地存储：每个线程独立的ThreadCache
+thread_local ThreadCache tls_thread_cache;
+// 对外接口
+void* PoolAllocate(size_t size) {
+    try {
+        return tls_thread_cache.Allocate(size);
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "PoolAllocate failed:" << e.what() << std::endl;
+        return nullptr;
+    }
+}
+void PoolDeallocate(void* ptr, size_t size) {
+    tls_thread_cache.Deallocate(ptr, size);
+}
+//测试代码
+struct TestObj {
+    int data[2];   //8B
+};
+
+//多线程并发测试
+void TestConcurrentAlloc() {
+    const int KThreadNum = 8;
+    const int KAllocNum = 100000;
+    std::vector<std::thread> threads;
+    for (int t=0;t < KThreadNum; ++t) {
+        //表示Lambda内部会按值拷贝外部作用域中用到的所有局部变量
+        threads.emplace_back([=]() {
+            std::vector<void*> ptrs;
+            ptrs.reserve(KAllocNum);
+            //分配
+            for(size_t i = 0; i < KAllocNum; ++i) {
+                ptrs.push_back(PoolAllocate(sizeof(TestObj)));
+                if(!ptrs.back()) {
+                    std::cerr << "Thread" << t << "Alloc failed" << std::endl;
+                    return;
+                }
+            }
+            //释放
+            for(void* ptr : ptrs) {
+                PoolDeallocate(ptr, sizeof(TestObj));
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    std::cout << "Concurrent allocation test passed!" << std::endl;
+}
+
+
+// 单线程测试
+void TestSingleThreadAlloc() {
+    TestObj* obj1 = static_cast<TestObj*>(PoolAllocate(sizeof(TestObj)));
+    TestObj* obj2 = static_cast<TestObj*>(PoolAllocate(sizeof(TestObj)));
+    TestObj* obj3 = static_cast<TestObj*>(PoolAllocate(sizeof(TestObj)));
+    if (!obj1 || !obj2 || !obj3) {
+        std::cerr << "Single thread allocate failed" << std::endl;
+        return;
+    }
+    obj1->data[0] = 1;
+    obj2->data[0] = 2;
+    obj3->data[0] = 3;
+    std::cout << "Single thread alloc: " << obj1 << " (data: " << obj1->data[0] << ")" << std::endl;
+    std::cout << "Single thread alloc: " << obj2 << " (data: " << obj2->data[0] << ")" << std::endl;
+    std::cout << "Single thread alloc: " << obj3 << " (data: " << obj3->data[0] << ")" << std::endl;
+    PoolDeallocate(obj1, sizeof(TestObj));
+    PoolDeallocate(obj2, sizeof(TestObj));
+    PoolDeallocate(obj3, sizeof(TestObj));
+    std::cout << "Single thread test passed!" << std::endl;
+}
+
+
+int main() {
+    
+    try {
+        std::cout << "Start TestSingleThreadAlloc" << std::endl;  // endl 会刷新缓冲区
+        TestSingleThreadAlloc();
+        std::cout << "End TestSingleThreadAlloc" << std::endl;
+        TestConcurrentAlloc();
+    } catch (const std::exception& e) {
+        std::cerr << "Test failed: " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
