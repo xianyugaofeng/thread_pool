@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstddef>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -349,8 +350,9 @@ class CentralCache {
             return instance;
         }
         //批量申请内存块
-        void* AllocateBatch(size_t size, size_t batch_num) {
-            if (size == 0 || batch_num == 0 || size > kMaxSmallObjSize) {
+        void* Allocate(size_t size, size_t batch_num, size_t& actual_num) {
+            actual_num = 0;
+            if (size == 0 || size > kMaxSmallObjSize) {
                 return nullptr;
             }
             size_t align_size = AlignUp(size, k_align);
@@ -380,40 +382,72 @@ class CentralCache {
             //从Span中取出batch_num个块
             void* start = span->free_list;
             void* end = start;
-            size_t actual_num = std::min(batch_num, span->free_count);
+            actual_num = std::min(batch_num, span->free_count);
+            if (actual_num == 0 || !end) {
+                return nullptr;
+            }
             for(size_t i = 0; i < actual_num - 1 && end; ++i) {
                 end = *reinterpret_cast<void**>(end);
             }
-            //更新Span的空闲链表
-            if (end) {
-                span->free_list = *reinterpret_cast<char**>(end);
-                *reinterpret_cast<char**>(end) = nullptr;
-            } else {
-                span->free_list = nullptr;
+            if (!end) {
+                actual_num = 0;
+                return nullptr;
             }
+            //更新Span的空闲链表
+            span->free_list = *reinterpret_cast<char**>(end);
+            *reinterpret_cast<char**>(end) = nullptr;
             span->free_count -= actual_num;
             return start;
         };
         //批量归还内存块
-        void DeallocateBatch(size_t size, void* start, size_t count) {
+        void Deallocate(size_t size, void* start, size_t count) {
             if (!start || size == 0 || count == 0 || size > kMaxSmallObjSize) {
                 return;
             }
             size_t align_size = AlignUp(size, k_align);
             size_t index = (align_size / k_align) - 1;
             std::lock_guard<std::mutex> lock(mutexs[index]);
-            //找到对应的Span
-            Span* span = PageCache::GetInstance().FindSpanByAddr(start);
-            if (!span) return;
-            // 将块插入该Span的空闲链表
-            *reinterpret_cast<void**>(reinterpret_cast<char*>(start) + (count - 1) * align_size) = span->free_list;
-            span->free_list = start;
-            span->free_count += count;
-            // 所有块都空闲，构建空闲链表
-            size_t total_blocks = (span->page_count * PageCache::GetInstance().GetPageSize()) / align_size;
-            if (span->free_count == total_blocks) {
-                m_span_lists[index].RemoveSpan(span);
-                PageCache::GetInstance().DeallocatePages(span);
+
+            // Validate the entire batch before modifying any Span freelist.
+            void* node = start;
+            const size_t page_size = PageCache::GetInstance().GetPageSize();
+            for (size_t i = 0; i < count; ++i) {
+                if (!node) {
+                    throw std::logic_error("CentralCache received a truncated free batch");
+                }
+                Span* span = PageCache::GetInstance().FindSpanByAddr(node);
+                const uintptr_t address = reinterpret_cast<uintptr_t>(node);
+                const uintptr_t span_begin = span
+                    ? static_cast<uintptr_t>(span->page_id) * page_size
+                    : 0;
+                const size_t span_size = span ? span->page_count * page_size : 0;
+                if (!span || !span->is_used || span->block_size != align_size ||
+                    address < span_begin || address - span_begin >= span_size ||
+                    (address - span_begin) % align_size != 0) {
+                    throw std::logic_error("CentralCache block does not belong to its original Span");
+                }
+                node = *reinterpret_cast<void**>(node);
+            }
+
+            node = start;
+            for (size_t i = 0; i < count; ++i) {
+                void* next = *reinterpret_cast<void**>(node);
+                Span* span = PageCache::GetInstance().FindSpanByAddr(node);
+                *reinterpret_cast<void**>(node) = span->free_list;
+                span->free_list = node;
+                ++span->free_count;
+                node = next;
+            }
+            // Blocks may belong to different spans, so reclaim each fully free span
+            // only after all blocks in the batch have been linked back.
+            for (Span* span = m_span_lists[index].head_->next; span != m_span_lists[index].tail_;) {
+                Span* next = span->next;
+                size_t total_blocks = (span->page_count * page_size) / align_size;
+                if (span->free_count == total_blocks) {
+                    m_span_lists[index].RemoveSpan(span);
+                    PageCache::GetInstance().DeallocatePages(span);
+                }
+                span = next;
             }
         };
         //Span Split 构建空闲链表
@@ -474,8 +508,8 @@ class ThreadCache {
         void Deallocate(void* ptr, size_t size) {
             if (!ptr || size == 0) return;
             // 大对象直接归还给PageCache
+            Span* span = PageCache::GetInstance().FindSpanByAddr(ptr);
             if (size > kMaxSmallObjSize) {
-                Span* span = PageCache::GetInstance().FindSpanByAddr(ptr);
                 if (span) {
                     PageCache::GetInstance().DeallocatePages(span);
                     return;
@@ -505,11 +539,12 @@ class ThreadCache {
         //向Central Cache批量申请内存块
         void FetchFromCentralCache(size_t index, size_t size) {
             size_t batch_num = CalculateBatchNum(size);
-            void* start = CentralCache::GetInstance().AllocateBatch(size, batch_num);
-            if(!start) throw std::bad_alloc();
+            size_t actual_num = 0;
+            void* start = CentralCache::GetInstance().Allocate(size, batch_num, actual_num);
+            if(!start || actual_num == 0) throw std::bad_alloc();
             FreeListNode* cur = static_cast<FreeListNode*>(start);
             FreeListNode* end = cur;
-            for(size_t i = 0; i < batch_num - 1; ++i) {
+            for(size_t i = 1; i < actual_num; ++i) {
                 end = end->next;
             }
             end->next = m_free_lists[index];
@@ -536,7 +571,7 @@ class ThreadCache {
             m_free_lists[index] = end->next;
             end->next = nullptr;
             //归还给CentralCache
-            CentralCache::GetInstance().DeallocateBatch(size, cur, batch_num);
+            CentralCache::GetInstance().Deallocate(size, cur, batch_num);
         }
 };
 
@@ -564,10 +599,11 @@ struct TestObj {
 void TestConcurrentAlloc() {
     const int KThreadNum = 8;
     const int KAllocNum = 100000;
+    std::atomic<bool> passed{true};
     std::vector<std::thread> threads;
     for (int t=0;t < KThreadNum; ++t) {
         //表示Lambda内部会按值拷贝外部作用域中用到的所有局部变量
-        threads.emplace_back([=]() {
+        threads.emplace_back([=, &passed]() {
             std::vector<void*> ptrs;
             ptrs.reserve(KAllocNum);
             //分配
@@ -575,6 +611,7 @@ void TestConcurrentAlloc() {
                 ptrs.push_back(PoolAllocate(sizeof(TestObj)));
                 if(!ptrs.back()) {
                     std::cerr << "Thread" << t << "Alloc failed" << std::endl;
+                    passed.store(false);
                     return;
                 }
             }
@@ -586,6 +623,10 @@ void TestConcurrentAlloc() {
     }
     for (auto& thread : threads) {
         thread.join();
+    }
+    if (!passed.load()) {
+        std::cerr << "Concurrent allocation test failed" << std::endl;
+        throw std::runtime_error("Concurrent allocation test failed");
     }
     std::cout << "Concurrent allocation test passed!" << std::endl;
 }
